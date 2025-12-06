@@ -1,0 +1,115 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# PyTorch
+*.pth
+*.pt
+checkpoints/
+
+# TensorFlow
+*.h5
+*.hdf5
+saved_model/
+logs/
+tensorboard_logs/
+
+# ===========================================
+# DATA FILES (Must be downloaded separately)
+# ===========================================
+
+# PlanetLab traces - Download from: https://github.com/beloglazov/planetlab-workload-traces
+data/planetlab/
+
+# Google cluster traces - Download from: https://github.com/google/cluster-data
+data/google_cluster/
+
+# ===========================================
+# CLOUDSIM (Optional - Java simulation)
+# ===========================================
+# CloudSim is optional and should be downloaded separately if needed
+# Download from: https://github.com/Cloudslab/cloudsim
+src/cloudsim/
+
+# ===========================================
+# Results and outputs (generated files)
+# ===========================================
+results/graphs/*.png
+results/metrics/*.csv
+results/metrics/*.json
+
+# Trained models (generated during training)
+models/*.pth
+models/*.h5
+models/*.json
+models/*.keras
+src/models/
+
+# ===========================================
+# Temporary and generated files
+# ===========================================
+*.csv
+*.json
+!requirements.txt
+!package.json
+*.log
+*.tmp
+*.temp
+temp/
+tmp/
+
+# Java build artifacts (if using CloudSim)
+*.class
+*.jar
+*.war
+*.ear
+*.nar
+target/
+.gradle/
+bin/
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Environment variables
+.env
+.env.local
