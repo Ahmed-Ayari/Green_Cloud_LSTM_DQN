@@ -306,6 +306,81 @@ class PerformanceVisualizer:
         sns.set_palette("husl")
         self.fig_count = 0
     
+    def plot_pareto_frontier(self, algorithm_results, save_path=None):
+        """
+        Plot Pareto frontier showing Energy vs SLA Violations trade-off
+        
+        Args:
+            algorithm_results: Dictionary with algorithm names as keys and 
+                              {'energy': float, 'sla': float, 'migrations': int} as values
+            save_path: Path to save figure
+        """
+        plt.figure(figsize=(10, 8))
+        
+        # Define markers and colors for each algorithm
+        markers = {'Static THR (80%)': 's', 'MMT + MBFD': '^', 'Hybrid LSTM-DQN': 'o'}
+        colors = {'Static THR (80%)': '#e74c3c', 'MMT + MBFD': '#f39c12', 'Hybrid LSTM-DQN': '#2ecc71'}
+        sizes = {'Static THR (80%)': 200, 'MMT + MBFD': 200, 'Hybrid LSTM-DQN': 300}
+        
+        # Plot each algorithm
+        for algo_name, metrics in algorithm_results.items():
+            energy = metrics['energy']
+            sla = metrics['sla']
+            
+            marker = markers.get(algo_name, 'o')
+            color = colors.get(algo_name, '#3498db')
+            size = sizes.get(algo_name, 150)
+            
+            plt.scatter(energy, sla, s=size, c=color, marker=marker, 
+                       label=algo_name, edgecolors='black', linewidths=1.5, alpha=0.8)
+            
+            # Add annotation
+            offset = (10, 10) if algo_name != 'Hybrid LSTM-DQN' else (10, -15)
+            plt.annotate(algo_name, (energy, sla), textcoords="offset points", 
+                        xytext=offset, ha='left', fontsize=10, fontweight='bold')
+        
+        # Draw Pareto frontier line (connecting non-dominated points)
+        points = [(m['energy'], m['sla'], name) for name, m in algorithm_results.items()]
+        points_sorted = sorted(points, key=lambda x: x[0])
+        
+        # Simple Pareto frontier (for visualization)
+        pareto_x = [p[0] for p in points_sorted]
+        pareto_y = [p[1] for p in points_sorted]
+        plt.plot(pareto_x, pareto_y, 'k--', alpha=0.3, linewidth=1.5, label='_nolegend_')
+        
+        # Highlight optimal region
+        plt.axhline(y=0, color='green', linestyle=':', alpha=0.5, linewidth=1)
+        plt.axvline(x=min(m['energy'] for m in algorithm_results.values()), 
+                   color='green', linestyle=':', alpha=0.5, linewidth=1)
+        
+        # Fill optimal region
+        min_energy = min(m['energy'] for m in algorithm_results.values())
+        plt.fill_between([0, min_energy], [0, 0], [0.5, 0.5], alpha=0.1, color='green')
+        plt.text(min_energy/2, 0.2, 'Optimal\nRegion', ha='center', va='center', 
+                fontsize=9, color='green', alpha=0.7)
+        
+        plt.xlabel('Energy Consumption (kWh)', fontsize=12, fontweight='bold')
+        plt.ylabel('SLA Violations (%)', fontsize=12, fontweight='bold')
+        plt.title('Pareto Frontier: Energy vs SLA Trade-off', fontsize=14, fontweight='bold')
+        plt.legend(loc='upper right', fontsize=10)
+        plt.grid(True, alpha=0.3)
+        
+        # Set axis limits with some padding
+        max_energy = max(m['energy'] for m in algorithm_results.values())
+        max_sla = max(m['sla'] for m in algorithm_results.values())
+        plt.xlim(0, max_energy * 1.2)
+        plt.ylim(-0.5, max(max_sla * 1.5, 5))
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"Pareto frontier saved to {save_path}")
+        
+        plt.close()
+        
+        return plt.gcf()
+    
     def plot_energy_comparison(self, comparison_df, save_path=None):
         """
         Plot energy consumption comparison

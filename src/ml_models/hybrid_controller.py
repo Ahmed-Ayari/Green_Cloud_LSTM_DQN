@@ -1,6 +1,7 @@
 """
 Hybrid LSTM-DQN Controller for VM Consolidation
 Integrates LSTM workload prediction with DQN decision-making
+Supports CloudSim integration via socket-based API
 """
 
 import numpy as np
@@ -8,9 +9,11 @@ import pandas as pd
 try:
     from .lstm_predictor import LSTMPredictor, MultiResourceLSTM
     from .dqn_agent import DQNAgent, ConsolidationAction
+    from .cloudsim_bridge import CloudSimBridge, FFDHostSelector, SimulationMode
 except ImportError:
     from lstm_predictor import LSTMPredictor, MultiResourceLSTM
     from dqn_agent import DQNAgent, ConsolidationAction
+    from cloudsim_bridge import CloudSimBridge, FFDHostSelector, SimulationMode
 import json
 import time
 from datetime import datetime
@@ -19,10 +22,12 @@ from datetime import datetime
 class HybridController:
     """
     Main controller integrating LSTM prediction and DQN decision-making
+    Supports both standalone Python simulation and CloudSim (Java) integration
     """
     
     def __init__(self, num_hosts, num_vms, lstm_sequence_length=10,
-                 target_update_frequency=10, config=None):
+                 target_update_frequency=10, config=None,
+                 use_cloudsim=False, cloudsim_host="localhost", cloudsim_port=9999):
         """
         Initialize Hybrid Controller
         
@@ -32,6 +37,9 @@ class HybridController:
             lstm_sequence_length: Lookback window for LSTM
             target_update_frequency: How often to update DQN target network
             config: Configuration dictionary
+            use_cloudsim: Whether to connect to CloudSim (Java)
+            cloudsim_host: CloudSim server host
+            cloudsim_port: CloudSim server port
         """
         self.num_hosts = num_hosts
         self.num_vms = num_vms
@@ -41,6 +49,18 @@ class HybridController:
         # Configuration
         self.config = config or self._default_config()
         
+        # CloudSim Bridge
+        self.use_cloudsim = use_cloudsim
+        sim_mode = SimulationMode.CLOUDSIM if use_cloudsim else SimulationMode.STANDALONE
+        self.cloudsim_bridge = CloudSimBridge(
+            host=cloudsim_host,
+            port=cloudsim_port,
+            mode=sim_mode
+        )
+        
+        # FFD Heuristic for candidate filtering
+        self.ffd_selector = FFDHostSelector(num_candidates=5)
+        
         # LSTM Predictor for each host
         self.predictors = {
             f'host_{i}': LSTMPredictor(
@@ -49,9 +69,13 @@ class HybridController:
             ) for i in range(num_hosts)
         }
         
-        # DQN Agent
-        state_size = num_hosts * 3 + 2  # current_util + predicted_util + capacity + num_vms + energy
-        action_size = num_hosts * num_hosts + 1  # All migration pairs + do_nothing
+        # DQN Agent with updated state size
+        # State: [U1...Un, Û1...Ûn, active_hosts_ratio]
+        state_size = num_hosts * 2 + 1  # current_util + predicted_util + active_hosts
+        
+        # Action space: filtered by FFD (top 5 targets per source) + do_nothing
+        # Maximum actions = num_hosts * 5 + 1
+        action_size = num_hosts * 5 + 1
         
         self.dqn_agent = DQNAgent(
             state_size=state_size,
@@ -62,6 +86,10 @@ class HybridController:
             epsilon_end=self.config['epsilon_end'],
             epsilon_decay=self.config['epsilon_decay']
         )
+        
+        # Action mapping (updated dynamically based on FFD filtering)
+        self.action_mapping = {}
+        self._update_action_mapping()
         
         # History tracking
         self.utilization_history = {f'host_{i}': [] for i in range(num_hosts)}
@@ -74,6 +102,39 @@ class HybridController:
         self.total_sla_violations = 0
         self.total_migrations = 0
         self.episode_count = 0
+        
+        # Initialize CloudSim bridge
+        self._initialize_simulation()
+    
+    def _initialize_simulation(self):
+        """Initialize the simulation environment"""
+        self.cloudsim_bridge.connect()
+        self.cloudsim_bridge.initialize_datacenter(
+            num_hosts=self.num_hosts,
+            num_vms=self.num_vms,
+            host_config={
+                "mips": 10000,
+                "ram": 16384,
+                "storage": 1000000,
+                "bandwidth": 10000,
+                "power_model": self.config['energy_model']
+            }
+        )
+    
+    def _update_action_mapping(self):
+        """
+        Update action mapping based on FFD-filtered candidates
+        This is called each step to dynamically filter valid actions
+        """
+        self.action_mapping = {0: ('do_nothing', None, None)}
+        action_idx = 1
+        
+        # For each source host, map to top 5 FFD targets
+        for source in range(self.num_hosts):
+            for target_rank in range(5):  # Top 5 candidates
+                if action_idx < self.dqn_agent.action_size:
+                    self.action_mapping[action_idx] = ('migrate', source, target_rank)
+                    action_idx += 1
     
     def _default_config(self):
         """Default configuration"""
@@ -155,34 +216,96 @@ class HybridController:
         Returns:
             state: State vector for DQN
         """
-        # Current utilizations (normalized)
+        # State vector: S = [U1...Un, Û1...Ûn, active_hosts_ratio]
+        # As per report: S = [U1, ..., Un, Û1, ..., Ûn, active_hosts]
+        
+        # Current utilizations (normalized to 0-1)
         current_util = np.array(hosts_utilization) / 100.0
         
-        # Predicted utilizations (normalized)
+        # Predicted utilizations from LSTM (normalized to 0-1)
         pred_util = np.array([predictions.get(i, 0) for i in range(self.num_hosts)]) / 100.0
         
-        # Host capacities (for simplicity, assume uniform capacity = 1.0)
-        capacities = np.ones(self.num_hosts)
+        # Active hosts ratio (normalized)
+        active_hosts = sum(1 for util in hosts_utilization if util > 0) / self.num_hosts
         
-        # Number of active VMs (normalized)
-        active_vms = sum(1 for util in hosts_utilization if util > 0) / self.num_hosts
-        
-        # Current energy consumption (normalized)
-        energy = self.calculate_energy(hosts_utilization) / (self.num_hosts * self.config['energy_model']['max_power'])
-        
-        # Concatenate all features
+        # Concatenate: [U1...Un, Û1...Ûn, active_hosts]
         state = np.concatenate([
-            current_util,
-            pred_util,
-            capacities,
-            [active_vms, energy]
+            current_util,      # Current utilizations
+            pred_util,         # LSTM predictions
+            [active_hosts]     # Active hosts ratio
         ])
         
         return state
     
-    def decode_action(self, action_idx):
+    def get_ffd_filtered_targets(self, hosts_utilization, source_host):
         """
-        Decode action index to consolidation action
+        Get FFD-filtered target hosts for a migration
+        
+        Args:
+            hosts_utilization: Current host utilizations
+            source_host: Source host ID
+            
+        Returns:
+            List of top 5 candidate target host IDs
+        """
+        # Get simulation state
+        state = self.cloudsim_bridge.get_simulation_state()
+        
+        # Use FFD to select top 5 target candidates
+        vm_cpu_requirement = 10.0  # Estimated VM CPU requirement
+        targets = self.ffd_selector.select_target_hosts_ffd(
+            state.hosts,
+            vm_cpu_requirement,
+            exclude_host=source_host
+        )
+        
+        return targets
+    
+    def decode_action(self, action_idx, hosts_utilization=None):
+        """
+        Decode action index to consolidation action using FFD filtering
+        
+        Args:
+            action_idx: Action index from DQN
+            hosts_utilization: Current host utilizations (for FFD filtering)
+            
+        Returns:
+            ConsolidationAction object
+        """
+        # Action 0 is "do nothing"
+        if action_idx == 0:
+            return ConsolidationAction('do_nothing')
+        
+        # Decode using action mapping
+        if action_idx in self.action_mapping:
+            action_type, source_host, target_rank = self.action_mapping[action_idx]
+            
+            if action_type == 'do_nothing':
+                return ConsolidationAction('do_nothing')
+            
+            # Get FFD-filtered targets for source host
+            if hosts_utilization is not None:
+                targets = self.get_ffd_filtered_targets(hosts_utilization, source_host)
+                if target_rank < len(targets):
+                    target_host = targets[target_rank]
+                else:
+                    return ConsolidationAction('do_nothing')
+            else:
+                # Fallback: use target_rank directly
+                target_host = target_rank
+            
+            return ConsolidationAction(
+                'migrate',
+                vm_id=None,
+                source_host=source_host,
+                target_host=target_host
+            )
+        
+        return ConsolidationAction('do_nothing')
+    
+    def decode_action_legacy(self, action_idx):
+        """
+        Legacy decode action (without FFD filtering)
         
         Args:
             action_idx: Action index from DQN
@@ -274,12 +397,31 @@ class HybridController:
         action = self.decode_action(action_idx)
         
         # Execute action and calculate metrics
-        # (In real implementation, this would interact with CloudSim)
+        # Update CloudSim bridge with current utilizations
+        for host_id, util in enumerate(hosts_utilization):
+            self.cloudsim_bridge.set_host_utilization(host_id, util)
+        
         energy_before = self.calculate_energy(hosts_utilization)
         sla_violations_before = self.calculate_sla_violations(hosts_utilization)
         
-        # Simulate action execution (placeholder)
-        hosts_utilization_after = self._simulate_action(hosts_utilization, action)
+        # Execute action via CloudSim bridge or simulation
+        migration_metrics = {}
+        if action.action_type == 'migrate' and action.source_host is not None:
+            success, migration_metrics = self.cloudsim_bridge.execute_migration(
+                vm_id=action.vm_id or 0,  # Default VM ID if not specified
+                source_host=action.source_host,
+                target_host=action.target_host
+            )
+            if not success:
+                action = ConsolidationAction('do_nothing')
+        
+        # Get updated state from CloudSim
+        sim_state = self.cloudsim_bridge.get_simulation_state()
+        hosts_utilization_after = [h.cpu_utilization for h in sim_state.hosts]
+        
+        # If standalone mode, simulate the action effect
+        if not hosts_utilization_after or all(u == 0 for u in hosts_utilization_after):
+            hosts_utilization_after = self._simulate_action(hosts_utilization, action)
         
         energy_after = self.calculate_energy(hosts_utilization_after)
         sla_violations_after = self.calculate_sla_violations(hosts_utilization_after)
@@ -333,14 +475,16 @@ class HybridController:
             'loss': loss,
             'epsilon': self.dqn_agent.epsilon,
             'predictions': predictions,
-            'trends': trends
+            'trends': trends,
+            'migration_time': migration_metrics.get('migration_time', 0),
+            'migration_energy_cost': migration_metrics.get('energy_cost', 0)
         }
         
         return action, reward, metrics
     
     def _simulate_action(self, hosts_utilization, action):
         """
-        Simulate action execution (placeholder for CloudSim integration)
+        Simulate action execution (fallback when CloudSim is not connected)
         
         Args:
             hosts_utilization: Current utilization
